@@ -1,19 +1,25 @@
+use std::collections::HashMap;
+use std::ops::Add;
+
 use nix::sys::signal::Signal::SIGCONT;
 use nix::{unistd::Pid};
 use nix::sys::wait::{waitpid, WaitStatus};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, Result};
-use nix::sys::ptrace;
+use nix::sys::ptrace::{self, AddressType};
+
+use crate::breakpoint::{Breakpoint}; 
 
 pub struct Debugger { 
   program_name: String,
   pid: Pid,
-  is_executing: bool 
+  is_executing: bool, 
+  breakpoints: HashMap<AddressType, Breakpoint>
 }
 
 impl Debugger { 
   pub fn new(program_name: String, pid: Pid) -> Self { 
-    Self { program_name, pid, is_executing: false}
+    Self { program_name, pid, is_executing: false, breakpoints: HashMap::new()}
   }
 
   pub fn run(&mut self) -> Result<()> { 
@@ -25,7 +31,7 @@ impl Debugger {
     match waitpid(self.pid, None)? {
       /* Sends SIGTRAP signal */
       WaitStatus::Stopped(_, _) => { 
-        println!("SIGTRAP received, ready to be debugged!"); 
+        println!("SIGTRAP received, {} ready to be debugged!", self.program_name); 
       }
       _ => {
         println!("Unexpected status, returning......."); 
@@ -43,6 +49,7 @@ impl Debugger {
       println!("No prev history"); 
     }
     loop {
+      println!("Value of is_executing is {}", self.is_executing);
       /* Ensure process is running  */
       if self.is_executing {
         match waitpid(self.pid, None)? {
@@ -104,7 +111,19 @@ impl Debugger {
 
     match command { 
       "continue" => {
-        ptrace::cont(self.pid, SIGCONT)?; 
+        ptrace::cont(self.pid, SIGCONT)?;
+        self.is_executing = true;
+      }
+      "break" => {
+        let addr_val = usize::from_str_radix(tokens[1].strip_prefix("0x").unwrap(), 16).unwrap();
+        let bp_addr = addr_val as AddressType;
+        
+        let mut bp = Breakpoint::new(self.pid, bp_addr);
+        match bp.enable() {
+          Ok(_) => println!("Breakpoint set at {}", addr_val),
+          Err(e) => println!("Failed to set breakpoint: {:?}", e),
+        }
+        self.breakpoints.insert(bp_addr, bp); 
       }
       _ => { 
         println!("Invalid command"); 
@@ -113,5 +132,4 @@ impl Debugger {
     Ok(())
 
   } 
-
 }

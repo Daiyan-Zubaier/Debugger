@@ -1,11 +1,15 @@
 use std::env; 
 use std::ffi::CString;
+use nix::libc::ADDR_NO_RANDOMIZE;
+use nix::libc::personality;
 use nix::unistd::fork; 
 use nix::unistd::ForkResult; 
 use nix::unistd::write; 
 use nix::sys::ptrace;
 
 mod debugger; 
+mod breakpoint;
+
 use debugger::Debugger; 
 
 fn main() {
@@ -25,6 +29,8 @@ fn main() {
             dbg.run();
         }
         Ok(ForkResult::Child) => {
+            let new_personality = ADDR_NO_RANDOMIZE as nix::libc::c_ulong; 
+            unsafe {personality(new_personality); } 
             write(std::io::stdout(), "Starting debugging process....\n".as_bytes()).ok();
             ptrace::traceme().expect("Failed to enable tracing");
             let program = CString::new(target_binary.as_str()).expect("CString creation failed");
