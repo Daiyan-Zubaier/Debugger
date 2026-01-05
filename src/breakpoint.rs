@@ -1,4 +1,3 @@
-use nix::errno::Errno;
 use nix::{unistd::Pid};
 use nix::sys::ptrace::{self, AddressType}; 
 
@@ -25,10 +24,11 @@ impl Breakpoint {
       self.addr, 
       written_data /* Replace last byte with breakpoint opcode */
     )?;
+    self.enabled_status = true; 
     Ok(())
   }
 
-  pub fn disable(&self) -> nix::Result<()> { 
+  pub fn disable(&mut self) -> nix::Result<()> { 
     let breakpoint_data = ptrace::read(self.pid, self.addr)?; 
     let saved_data = self.saved_data as i64; 
     ptrace::write(
@@ -36,6 +36,7 @@ impl Breakpoint {
       self.addr, 
       (breakpoint_data & !0xFF) | saved_data  
     )?;
+    self.enabled_status = false; 
     Ok(()) 
   }
 } 

@@ -1,14 +1,15 @@
 use std::collections::HashMap;
-use std::ops::Add;
 
+use nix::Result;
 use nix::sys::signal::Signal::SIGCONT;
 use nix::{unistd::Pid};
 use nix::sys::wait::{waitpid, WaitStatus};
 use rustyline::error::ReadlineError;
-use rustyline::{DefaultEditor, Result};
+use rustyline::{DefaultEditor};
 use nix::sys::ptrace::{self, AddressType};
 
 use crate::breakpoint::{Breakpoint}; 
+use crate::registers::{REG_DESCS, get_reg_val_from_dwarf, get_register_from_name, get_register_name, get_register_value, set_register_value};
 
 pub struct Debugger { 
   program_name: String,
@@ -22,7 +23,7 @@ impl Debugger {
     Self { program_name, pid, is_executing: false, breakpoints: HashMap::new()}
   }
 
-  pub fn run(&mut self) -> Result<()> { 
+  pub fn run(&mut self) -> rustyline::Result<()> { 
     /* 
      * For now Option is set to None. This means it only blocks until child exits or is killed. 
      * options is a bitmask that determines which state transitions to block 
@@ -49,7 +50,6 @@ impl Debugger {
       println!("No prev history"); 
     }
     loop {
-      println!("Value of is_executing is {}", self.is_executing);
       /* Ensure process is running  */
       if self.is_executing {
         match waitpid(self.pid, None)? {
@@ -125,11 +125,68 @@ impl Debugger {
         }
         self.breakpoints.insert(bp_addr, bp); 
       }
+      "register" => {
+        match tokens[1] {
+          "dump" => {
+            for reg_desc in REG_DESCS.iter() {
+              let value = get_register_value(self.pid, reg_desc.reg)?;
+              println!("{:<10}  {:0>16x}", reg_desc.name, value);
+            }
+          }
+          /*
+           * Assumed command:
+           * register read <reg_name>  
+           */
+          "read" => {
+            let register_name = get_register_from_name(tokens[2]); 
+            match register_name { 
+              Some(reg_name) => println!("{}", get_register_value(self.pid, reg_name)?), 
+              None => println!("Invalid register_name...."),  
+            }
+          }
+          /*
+           * Assumed command: 
+           * register write <reg_name> 0x<Value> 
+           */
+          "write" => {
+            let value_string = tokens[3].strip_prefix("0x").unwrap_or(tokens[3]);
+            let value = match u64::from_str_radix(value_string, 16) {
+              Ok(v) => v,
+              Err(_) => {
+                println!("Invalid hex value: {}", value_string);
+                return Ok(());
+              }
+            }; // let value 
+            let reg_name = get_register_from_name(tokens[2]); 
+            match reg_name { 
+              Some(reg) => set_register_value(self.pid, reg, value)?,
+              None => println!("Invalid register name..."), 
+            }
+          }
+          _ => {
+            println!("Command not found"); 
+          }
+        }
+      }
+      "memory" => { 
+        let addr = usize::from_str_radix(tokens[2].strip_prefix("0x").unwrap(), 16).unwrap();
+        match tokens[1] {
+          "read" => {
+            
+          } 
+          "write" => {
+            
+          }
+          _ => {
+            println!("Invalid memory command");
+          }
+        }
+      }
       _ => { 
         println!("Invalid command"); 
       }
     }
     Ok(())
-
   } 
+
 }

@@ -9,6 +9,7 @@ use nix::sys::ptrace;
 
 mod debugger; 
 mod breakpoint;
+mod registers; 
 
 use debugger::Debugger; 
 
