@@ -23,6 +23,7 @@ fn main() {
     println!("Starting debugger...."); 
 
     /* Create a new child process (This will become our target program to debug) */
+    //TODO Cleanup code below
     match unsafe{fork()} {
         Ok(ForkResult::Parent { child, ..}) => { 
             println!("In parent process... child PID: {}, program_name: {}", child, target_binary.to_string()); 
