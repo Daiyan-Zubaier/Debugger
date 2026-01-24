@@ -5,7 +5,3 @@ The reason I decided to write the debugger in rust rather than C++ was to avoid 
 
 ## Commands
 Refer to handle_commands in debugger.rs
-
-## Dependencies
-- `nix` - Unix system call wrappers
-- `rustyline` - Command-line editing
