@@ -1,16 +1,14 @@
 use std::collections::HashMap;
 
 use nix::Result;
-use nix::libc::c_long;
+use nix::libc::{SI_KERNEL, TRAP_BRKPT, TRAP_TRACE, c_long};
 use nix::sys::ptrace::{self, AddressType};
-use nix::sys::signal::Signal::SIGCONT;
+use nix::sys::signal::Signal::{self, SIGCONT};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
-
-use std::fs as stdfs;
 
 use crate::breakpoint::Breakpoint;
 use crate::elf_debug_info::ElfDebugInfo;
@@ -18,19 +16,32 @@ use crate::registers::{
   REG_DESCS, Register, get_register_from_name, get_register_value, set_register_value,
 };
 
+/// Struct to hold debugger information
 pub struct Debugger {
+  /// Path to program
   program_name: String,
+
+  /// Program will run on child process, this is the pid for that
   pid: Pid,
+
+  /// Flag to see if program is executing
   is_executing: bool,
+
+  /// A hash map of all breakpoints
   breakpoints: HashMap<AddressType, Breakpoint>,
+
+  /// AN object to hold debug info
   debug_info: ElfDebugInfo,
 }
 
 impl Debugger {
   /// Construct new Debugger object
   pub fn new(program_name: String, pid: Pid) -> Self {
-    let debug_info =
-      ElfDebugInfo::new(program_name.clone()).expect("failed to load DWARF debug info");
+    let debug_info = match ElfDebugInfo::new(program_name.clone()) {
+      Ok(value) => value,
+      Err(e) => panic!("Error constructing ElfDebugInfo: {}", e),
+    };
+
     Self {
       program_name,
       pid,
@@ -70,31 +81,21 @@ impl Debugger {
     }
 
     loop {
-      // Ensure process is running
+      // Wait for process state changes when executing
       if self.is_executing {
         match waitpid(self.pid, None)? {
           WaitStatus::Stopped(_, sig) => {
             println!("Stopped by {:?}", sig);
 
-            let mut pc = self.get_pc()?;
-
-            // If we trapped due to an INT3 breakpoint, RIP is typically one byte past
-            // the breakpoint site. Use RIP-1 for symbolization.
-            if sig == nix::sys::signal::Signal::SIGTRAP {
-              pc = pc.saturating_sub(1);
+            match sig {
+              Signal::SIGTRAP => self.handle_sigtrap()?,
+              Signal::SIGSEGV => self.handle_sigsegv()?,
+              _ => {
+                println!("Got signal: {:?}", sig);
+                self.is_executing = false;
+              }
             }
-
-            println!("PC = 0x{:x}", pc);
-            self.print_location(pc);
-
-            // Only step over breakpoint if we stopped due to SIGTRAP
-            if sig == nix::sys::signal::Signal::SIGTRAP {
-              self.stepover_breakpoint()?;
-            }
-
-            self.is_executing = false;
           }
-
           WaitStatus::Exited(_, code) => {
             println!("Exited with {}", code);
             break;
@@ -107,7 +108,6 @@ impl Debugger {
             println!("Other status: {:?}", other);
           }
         }
-        continue;
       }
 
       // Collect user input
@@ -308,9 +308,6 @@ impl Debugger {
 
   /// Prints location
   fn print_location(&self, runtime_pc: u64) {
-    // IMPORTANT:
-    // For PIE/ASLR, runtime_pc may need normalization (subtract load bias).
-    // For now we assume non-PIE or that addresses match DWARF.
     let dwarf_pc = self.to_dwarf_pc(runtime_pc);
 
     let func = self.debug_info.pc_to_function(dwarf_pc).ok().flatten();
@@ -331,6 +328,8 @@ impl Debugger {
       }
     }
   }
+
+  /// Loads bias
   fn load_bias(&self) -> std::io::Result<u64> {
     let maps_path = format!("/proc/{}/maps", self.pid);
     let maps = std::fs::read_to_string(maps_path)?;
@@ -396,14 +395,15 @@ impl Debugger {
       Err(_) => runtime_pc, // fallback: non-PIE or couldn't read maps
     }
   }
+
   fn to_runtime_addr(&self, dwarf_addr: u64) -> u64 {
     match self.load_bias() {
       Ok(bias) => bias.saturating_add(dwarf_addr),
       Err(_) => dwarf_addr,
     }
   }
+
   fn step_over_line(&mut self) -> Result<()> {
-    let start_pc = self.get_pc()?;
     let start_line = self.get_current_line();
 
     loop {
@@ -450,5 +450,51 @@ impl Debugger {
     let pc = self.get_pc().ok()?;
     let dwarf_pc = self.to_dwarf_pc(pc);
     self.debug_info.pc_to_file_line(dwarf_pc).ok().flatten()
+  }
+
+  fn handle_sigtrap(&mut self) -> Result<()> {
+    let sig_info = ptrace::getsiginfo(self.pid)?;
+
+    match sig_info.si_code {
+      // Check if breakpoint
+      x if x == TRAP_BRKPT || x == SI_KERNEL => {
+        let mut pc = self.get_pc()?;
+        let bp_address = pc.saturating_sub(1) as AddressType;
+
+        let hit_bp = self.breakpoints.contains_key(&bp_address);
+        if hit_bp {
+          pc = pc.saturating_sub(1);
+        }
+
+        println!("PC = 0x{:x}", pc);
+        self.print_location(pc);
+
+        if hit_bp {
+          self.stepover_breakpoint()?;
+        }
+
+        self.is_executing = false;
+      }
+      TRAP_TRACE => {
+        println!("UNIMPLEMENTED");
+      }
+      _ => println!("Uknown SIGTRAP code: {}", sig_info.si_code),
+    };
+
+    Ok(())
+  }
+
+  fn handle_sigsegv(&mut self) -> Result<()> {
+    let sig_info = ptrace::getsiginfo(self.pid)?;
+
+    println!(
+      "Segfault! Reason Code: {}, Address {:?}",
+      sig_info.si_code,
+      unsafe { sig_info.si_addr() }
+    );
+
+    self.is_executing = false;
+    
+    Ok(())
   }
 }

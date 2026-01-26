@@ -44,7 +44,7 @@ fn main() {
         std::io::stdout(),
         "Starting debugging process....\n".as_bytes(),
       )
-      .ok();
+      .unwrap();
       ptrace::traceme().expect("Failed to enable tracing");
       let program = CString::new(target_binary.as_str()).expect("CString creation failed");
       let args = [program.clone()];
