@@ -4,5 +4,8 @@
     "editor.formatOnSave": true,
     "editor.tabSize": 2
   },
-  "rust-analyzer.rustfmt.extraArgs": []
+  "rust-analyzer.rustfmt.extraArgs": [],
+  "chat.tools.terminal.autoApprove": {
+    "cargo build": true
+  }
 }

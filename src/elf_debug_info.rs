@@ -69,6 +69,52 @@ impl ElfDebugInfo {
       .inner
       .with_dependent(|_mmap, parser| parser.pc_to_function(pc))
   }
+
+  /// Get the address range (low_pc, high_pc) of the function containing `pc`
+  /// Returns Vec of ranges to handle non-contiguous functions (optimized code)
+  pub fn get_function_ranges(&self, pc: u64) -> Result<Option<Vec<(u64, u64)>>> {
+    self
+      .inner
+      .with_dependent(|_mmap, parser| parser.get_function_ranges(pc))
+  }
+
+  /// Legacy single-range version (returns first range only)
+  pub fn get_function_range(&self, pc: u64) -> Result<Option<(u64, u64)>> {
+    Ok(
+      self
+        .get_function_ranges(pc)?
+        .and_then(|ranges| ranges.into_iter().next()),
+    )
+  }
+
+  /// Get all line table addresses within function ranges, excluding the current address
+  pub fn get_line_addresses_in_ranges(
+    &self,
+    ranges: &[(u64, u64)],
+    exclude_addr: u64,
+  ) -> Result<Vec<u64>> {
+    self
+      .inner
+      .with_dependent(|_mmap, parser| parser.get_line_addresses_in_ranges(ranges, exclude_addr))
+  }
+
+  /// Legacy single-range version
+  pub fn get_line_addresses_in_range(
+    &self,
+    low_pc: u64,
+    high_pc: u64,
+    exclude_addr: u64,
+  ) -> Result<Vec<u64>> {
+    self.get_line_addresses_in_ranges(&[(low_pc, high_pc)], exclude_addr)
+  }
+
+  /// Convert a file name and line number to address(es)
+  /// Returns DWARF addresses (need to convert to runtime addresses)
+  pub fn file_line_to_addr(&self, filename: &str, line_num: u64) -> Result<Vec<u64>> {
+    self
+      .inner
+      .with_dependent(|_mmap, parser| parser.file_line_to_addr(filename, line_num))
+  }
 }
 
 impl<'a> DebugParser<'a> {
@@ -126,7 +172,7 @@ impl<'a> DebugParser<'a> {
 
       while let Some((depth, entry)) = entries.next_dfs()? {
         if depth == 0 && entry.tag() == gimli::DW_TAG_compile_unit {
-          cu_matches_pc = self.die_covers_pc(entry, pc)?;
+          cu_matches_pc = self.die_covers_pc(entry, &unit, &dwarf, pc)?;
           break;
         }
       }
@@ -238,7 +284,7 @@ impl<'a> DebugParser<'a> {
       // Run a DFS search, depth represents the hierchal structure, entry is the actual info
       while let Some((_depth, entry)) = entries.next_dfs()? {
         if entry.tag() == gimli::DW_TAG_subprogram {
-          if self.die_covers_pc(entry, pc)? {
+          if self.die_covers_pc(entry, &unit, &dwarf, pc)? {
             if let Some(attr) = entry.attr(gimli::DW_AT_name)? {
               let raw = dwarf.attr_string(&unit, attr.value())?; // Raw bytes
               let name = raw.to_string_lossy().into_owned(); // Converts raw bytes to string
@@ -254,31 +300,226 @@ impl<'a> DebugParser<'a> {
 
   /// Check if PC is in current DIE
   /// Returns true if it is, false otherwise
+  /// Handles both simple low_pc/high_pc and range lists (DW_AT_ranges)
   fn die_covers_pc(
     &self,
     entry: &gimli::DebuggingInformationEntry<Endian<'_>>,
+    unit: &gimli::Unit<Endian<'_>>,
+    dwarf: &Dwarf<Endian<'_>>,
     pc: u64,
   ) -> Result<bool> {
+    let ranges = self.get_die_ranges(entry, unit, dwarf)?;
+    for (low, high) in ranges {
+      if pc >= low && pc < high {
+        return Ok(true);
+      }
+    }
+    Ok(false)
+  }
+
+  /// Extract address ranges from a DIE (handles both low_pc/high_pc and DW_AT_ranges)
+  fn get_die_ranges(
+    &self,
+    entry: &gimli::DebuggingInformationEntry<Endian<'_>>,
+    unit: &gimli::Unit<Endian<'_>>,
+    dwarf: &Dwarf<Endian<'_>>,
+  ) -> Result<Vec<(u64, u64)>> {
+    // First try DW_AT_ranges (used for non-contiguous code, e.g., optimized builds)
+    if let Some(ranges_attr) = entry.attr_value(gimli::DW_AT_ranges)? {
+      let mut result = Vec::new();
+
+      // Convert to RangeListsOffset and use ranges() for both DWARF 4 and 5
+      let offset = match ranges_attr {
+        gimli::AttributeValue::RangeListsRef(raw_offset) => {
+          // DWARF 4 style
+          gimli::RangeListsOffset(raw_offset.0)
+        }
+        gimli::AttributeValue::DebugRngListsIndex(idx) => {
+          // DWARF 5 style
+          match dwarf.ranges_offset(unit, idx) {
+            Ok(o) => o,
+            Err(_) => return Ok(vec![]),
+          }
+        }
+        _ => return Ok(vec![]),
+      };
+
+      if let Ok(mut ranges) = dwarf.ranges(unit, offset) {
+        while let Ok(Some(range)) = ranges.next() {
+          if range.begin < range.end {
+            result.push((range.begin, range.end));
+          }
+        }
+      }
+
+      if !result.is_empty() {
+        return Ok(result);
+      }
+    }
+
+    // Fall back to simple low_pc/high_pc
     let low_pc = match entry.attr_value(gimli::DW_AT_low_pc)? {
       Some(gimli::AttributeValue::Addr(a)) => a,
-      _ => return Ok(false), // no low_pc => can't use this simple path
+      _ => return Ok(vec![]),
     };
 
     let high_attr = match entry.attr_value(gimli::DW_AT_high_pc)? {
       Some(v) => v,
-      None => return Ok(false),
+      None => return Ok(vec![]),
     };
 
     let high_pc = match high_attr {
       gimli::AttributeValue::Addr(a) => a,
       gimli::AttributeValue::Udata(off) => low_pc + off,
-      _ => return Ok(false),
+      _ => return Ok(vec![]),
     };
 
-    if pc >= low_pc && pc < high_pc {
-      return Ok(true);
+    Ok(vec![(low_pc, high_pc)])
+  }
+
+  /// Get the address ranges of the function containing `pc`
+  /// Returns Vec of (start, end) pairs to handle non-contiguous functions
+  pub fn get_function_ranges(&self, pc: u64) -> Result<Option<Vec<(u64, u64)>>> {
+    let dwarf = self.dwarf();
+    let mut units = dwarf.units();
+
+    while let Some(header) = units.next()? {
+      let unit = dwarf.unit(header)?;
+      let mut entries = unit.entries();
+
+      while let Some((_depth, entry)) = entries.next_dfs()? {
+        if entry.tag() == gimli::DW_TAG_subprogram {
+          let ranges = self.get_die_ranges(entry, &unit, &dwarf)?;
+
+          // Check if pc falls within any of the ranges
+          for &(low, high) in &ranges {
+            if pc >= low && pc < high {
+              return Ok(Some(ranges));
+            }
+          }
+        }
+      }
+    }
+    Ok(None)
+  }
+
+  /// Get all unique line addresses within ranges, excluding a specific address
+  pub fn get_line_addresses_in_ranges(
+    &self,
+    ranges: &[(u64, u64)],
+    exclude_addr: u64,
+  ) -> Result<Vec<u64>> {
+    let dwarf = self.dwarf();
+    let mut units = dwarf.units();
+    let mut addresses = Vec::new();
+
+    while let Some(header) = units.next()? {
+      let unit = dwarf.unit(header)?;
+
+      let Some(program) = unit.line_program.clone() else {
+        continue;
+      };
+
+      let mut rows = program.rows();
+
+      while let Some((_header, row)) = rows.next_row()? {
+        if row.end_sequence() {
+          continue;
+        }
+
+        let addr = row.address();
+
+        // Check if address falls within any of our ranges
+        let in_range = ranges.iter().any(|&(low, high)| addr >= low && addr < high);
+
+        if in_range && addr != exclude_addr && !addresses.contains(&addr) {
+          addresses.push(addr);
+        }
+      }
     }
 
-    Ok(false)
+    Ok(addresses)
+  }
+
+  /// Convert a file name and line number to address(es)
+  /// Returns addresses where the given line starts (there can be multiple due to inlining)
+  pub fn file_line_to_addr(&self, filename: &str, line_num: u64) -> Result<Vec<u64>> {
+    let dwarf = self.dwarf();
+    let mut units = dwarf.units();
+    let mut addresses = Vec::new();
+
+    while let Some(header) = units.next()? {
+      let unit = dwarf.unit(header)?;
+
+      let Some(program) = unit.line_program.clone() else {
+        continue;
+      };
+
+      // Helper: resolve a DWARF "string-ish" AttributeValue into a Rust String.
+      let resolve_attr_string = |attr: gimli::AttributeValue<Endian<'_>>| -> Result<String> {
+        let s = dwarf.attr_string(&unit, attr)?;
+        Ok(s.to_string_lossy().into_owned())
+      };
+
+      let mut rows = program.rows();
+
+      while let Some((line_header, row)) = rows.next_row()? {
+        if row.end_sequence() {
+          continue;
+        }
+
+        // Check if line matches
+        let Some(line_nz) = row.line() else {
+          continue;
+        };
+        let row_line = line_nz.get();
+        if row_line != line_num {
+          continue;
+        }
+
+        // Resolve file path for this row
+        let Some(file_entry) = line_header.file(row.file_index()) else {
+          continue;
+        };
+
+        let file_name = resolve_attr_string(file_entry.path_name())?;
+
+        // Build full path
+        let full_path = if file_name.starts_with('/') {
+          file_name.clone()
+        } else {
+          let dir = if file_entry.directory_index() != 0 {
+            if let Some(dir_attr) = line_header.directory(file_entry.directory_index()) {
+              resolve_attr_string(dir_attr)?
+            } else {
+              String::new()
+            }
+          } else {
+            String::new()
+          };
+
+          if dir.is_empty() {
+            file_name.clone()
+          } else if dir.ends_with('/') {
+            format!("{dir}{file_name}")
+          } else {
+            format!("{dir}/{file_name}")
+          }
+        };
+
+        // Check if filename matches (support both basename and full path matching)
+        let matches =
+          full_path.ends_with(filename) || file_name == filename || full_path == filename;
+
+        if matches {
+          let addr = row.address();
+          if !addresses.contains(&addr) {
+            addresses.push(addr);
+          }
+        }
+      }
+    }
+
+    Ok(addresses)
   }
 }
