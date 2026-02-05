@@ -1,7 +1,6 @@
 use nix::Result;
 use nix::libc::c_long;
 use nix::sys::ptrace::{self, AddressType};
-use nix::sys::signal::Signal::SIGCONT;
 use nix::sys::wait::waitpid;
 
 use crate::breakpoint::Breakpoint;
@@ -407,7 +406,6 @@ impl Debugger {
     // Try multiple ways to find return address depending on where we are in the prologue
     let frame_ptr = get_register_value(self.pid, Register::Rbp)?;
     let stack_ptr = get_register_value(self.pid, Register::Rsp)?;
-    let pc = self.get_pc()?;
 
     let mut return_address = None;
 
@@ -524,7 +522,6 @@ impl Debugger {
     }
 
     let dwarf_pc = self.get_dwarf_pc()?;
-    let current_pc = self.get_pc()?;
 
     // Get the function's address ranges (may be non-contiguous in optimized code)
     let Some(func_ranges) = self.debug_info.get_function_ranges(dwarf_pc).ok().flatten() else {
@@ -588,7 +585,6 @@ impl Debugger {
           let addr = rsp_return as AddressType;
           if !self.breakpoints.contains_key(&addr) {
             self.set_temp_breakpoint(addr)?;
-            return_bp_set = true;
           }
         }
       }

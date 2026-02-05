@@ -1,5 +1,8 @@
 ## Description
 
+# TODO:
+- stack trace
+- variable handling
 
 # Sources
 Based on: https://tartanllama.xyz/posts/writing-a-linux-debugger/setup/ 

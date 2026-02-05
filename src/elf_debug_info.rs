@@ -188,7 +188,7 @@ impl<'a> DebugParser<'a> {
 
       // Helper: resolve a DWARF "string-ish" AttributeValue into a Rust String.
       // Works for debug_str refs, inline strings, etc.
-      let mut resolve_attr_string = |attr: gimli::AttributeValue<Endian<'_>>| -> Result<String> {
+      let resolve_attr_string = |attr: gimli::AttributeValue<Endian<'_>>| -> Result<String> {
         let s = dwarf.attr_string(&unit, attr)?;
         Ok(s.to_string_lossy().into_owned())
       };
