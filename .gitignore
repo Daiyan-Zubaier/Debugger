@@ -1,7 +1,4 @@
 /target
 history.txt
-program_target/main
-program_target/test_loop
-program_target/seg_fault
-program_target/test_step
-.vscode
+program_target/build/
+.vscode/

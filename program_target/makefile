@@ -2,37 +2,42 @@ CC = gcc
 CFLAGS_DEBUG = -g -O0
 CFLAGS_OPTIMIZED = -g -O2
 
+BUILD_DIR = build
+
 # Default target
 all: main test_step test_loop seg_fault
 
+# Ensure build directory exists
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
 # Main test program
-main: main.c
-	$(CC) $(CFLAGS_DEBUG) main.c -o main
+main: main.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS_DEBUG) $< -o $(BUILD_DIR)/$@
 
 # Stepping test program
-test_step: test_step.c
-	$(CC) $(CFLAGS_DEBUG) test_step.c -o test_step
+test_step: test_step.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS_DEBUG) $< -o $(BUILD_DIR)/$@
 
-# Loop/conditional test program  
-test_loop: test_loop.c
-	$(CC) $(CFLAGS_DEBUG) test_loop.c -o test_loop
+# Loop/conditional test program
+test_loop: test_loop.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS_DEBUG) $< -o $(BUILD_DIR)/$@
 
 # Optimized versions (may produce non-contiguous function ranges)
-test_step_opt: test_step.c
-	$(CC) $(CFLAGS_OPTIMIZED) test_step.c -o test_step_opt
+test_step_opt: test_step.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS_OPTIMIZED) $< -o $(BUILD_DIR)/$@
 
-test_loop_opt: test_loop.c
-	$(CC) $(CFLAGS_OPTIMIZED) test_loop.c -o test_loop_opt
+test_loop_opt: test_loop.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS_OPTIMIZED) $< -o $(BUILD_DIR)/$@
 
 # Segfault test
-seg_fault: seg_fault.c
-	$(CC) $(CFLAGS_DEBUG) seg_fault.c -o seg_fault
+seg_fault: seg_fault.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS_DEBUG) $< -o $(BUILD_DIR)/$@
 
 # Build all optimized versions
 optimized: test_step_opt test_loop_opt
 
-# Clean up
 clean:
-	rm -f main test_step test_loop test_step_opt test_loop_opt seg_fault
+	rm -rf $(BUILD_DIR)
 
 .PHONY: all optimized clean
