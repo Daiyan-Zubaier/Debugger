@@ -46,6 +46,13 @@ impl Debugger {
     if self.has_crashed {
       println!("Warning: Program has crashed. Continuing will terminate the process.");
     }
+
+    // Clean up any temp breakpoints from step_over commands
+    let temp_addrs: Vec<_> = self.temp_breakpoints.iter().copied().collect();
+    for addr in temp_addrs {
+      self.cleanup_temp_breakpoint(addr)?;
+    }
+
     // Note: stepover_breakpoint is already called by signal handler when we hit breakpoint
     ptrace::cont(self.pid, None)?;
     self.is_executing = true;
@@ -53,7 +60,7 @@ impl Debugger {
   }
 
   /// Handle break command
-  /// Supports: break 0x<addr>  OR  break filename:line
+  /// Supports: break 0x<addr> OR break filename:line
   fn cmd_break(&mut self, tokens: &[&str]) -> Result<()> {
     let arg = match tokens.get(1) {
       Some(a) => *a,
@@ -309,7 +316,7 @@ impl Debugger {
   }
 
   /// Step into: single-step instructions until the source line changes,
-  /// then print the new source line.
+  /// then print the new source line
   pub(crate) fn step_in(&mut self) -> Result<()> {
     if self.has_crashed {
       println!(
@@ -364,7 +371,7 @@ impl Debugger {
 
     let start_line_num = start_line.as_ref().map(|(_, l)| *l);
 
-    // Cap iterations to avoid pathological cases where line info doesn't advance.
+    // Cap iterations to avoid pathological cases where line info doesn't advance
     let mut steps = 0usize;
     loop {
       self.single_step()?;
@@ -378,7 +385,7 @@ impl Debugger {
       }
 
       if steps > 4096 {
-        // Fallback: stop stepping to avoid infinite loop.
+        // Fallback: stop stepping to avoid infinite loop
         println!("Step limit reached");
         break;
       }
@@ -403,39 +410,57 @@ impl Debugger {
       return Ok(());
     }
 
+    // Clean up any temp breakpoints from previous step_over calls
+    let temp_addrs: Vec<_> = self.temp_breakpoints.iter().copied().collect();
+    for addr in temp_addrs {
+      self.cleanup_temp_breakpoint(addr)?;
+    }
+
     // Try multiple ways to find return address depending on where we are in the prologue
     let frame_ptr = get_register_value(self.pid, Register::Rbp)?;
     let stack_ptr = get_register_value(self.pid, Register::Rsp)?;
 
     let mut return_address = None;
 
-    // Method 1: Traditional RBP+8 (works after prologue completes: push rbp; mov rsp, rbp)
+    // Collect all candidate return addresses and pick the best one
+    let mut candidates: Vec<u64> = Vec::new();
+
+    // Method 1: [RSP] - works at function entry (before push rbp)
+    if let Ok(rsp_value) = ptrace::read(self.pid, stack_ptr as AddressType) {
+      let rsp_value = rsp_value as u64;
+      if self.is_any_executable_address(rsp_value) {
+        candidates.push(rsp_value);
+      }
+    }
+
+    // Method 2: [RSP+8] - works right after push rbp, before mov rsp, rbp
+    if let Ok(rsp_plus_8) = ptrace::read(self.pid, (stack_ptr + 8) as AddressType) {
+      let rsp_plus_8 = rsp_plus_8 as u64;
+      if self.is_any_executable_address(rsp_plus_8) && !candidates.contains(&rsp_plus_8) {
+        candidates.push(rsp_plus_8);
+      }
+    }
+
+    // Method 3: [RBP+8] - traditional method after prologue completes
     if let Ok(rbp_plus_8) = ptrace::read(self.pid, (frame_ptr + 8) as AddressType) {
       let rbp_plus_8 = rbp_plus_8 as u64;
-      if self.is_valid_code_address(rbp_plus_8) {
-        return_address = Some(rbp_plus_8);
+      if self.is_any_executable_address(rbp_plus_8) && !candidates.contains(&rbp_plus_8) {
+        candidates.push(rbp_plus_8);
       }
     }
 
-    // Method 2: RSP+8 (works right after push rbp, before mov rsp, rbp)
-    // Stack is: [saved_rbp <- RSP] [return_addr <- RSP+8]
-    if return_address.is_none() {
-      if let Ok(rsp_plus_8) = ptrace::read(self.pid, (stack_ptr + 8) as AddressType) {
-        let rsp_plus_8 = rsp_plus_8 as u64;
-        if self.is_valid_code_address(rsp_plus_8) {
-          return_address = Some(rsp_plus_8);
-        }
+    // Prefer return addresses in OUR program over library addresses
+    // This handles the case where RBP+8 points to libc but RSP points to our code
+    for &addr in &candidates {
+      if self.is_valid_code_address(addr) {
+        return_address = Some(addr);
+        break;
       }
     }
 
-    // Method 3: [RSP] itself (if at ret instruction, RSP points directly at return address)
-    if return_address.is_none() {
-      if let Ok(rsp_value) = ptrace::read(self.pid, stack_ptr as AddressType) {
-        let rsp_value = rsp_value as u64;
-        if self.is_valid_code_address(rsp_value) {
-          return_address = Some(rsp_value);
-        }
-      }
+    // If none are in our program, use the first valid candidate (library address)
+    if return_address.is_none() && !candidates.is_empty() {
+      return_address = Some(candidates[0]);
     }
 
     // If we found a valid return address, set breakpoint there
@@ -461,13 +486,31 @@ impl Debugger {
       .ok()
       .flatten();
 
+    // Get starting frame pointer - when RBP increases past this, we've returned
+    let start_rbp = get_register_value(self.pid, Register::Rbp)?;
+
     let mut steps = 0usize;
+
     loop {
       self.single_step()?;
-      waitpid(self.pid, None)?;
+
+      // Check if process exited
+      match waitpid(self.pid, None)? {
+        nix::sys::wait::WaitStatus::Exited(_, code) => {
+          println!("Process exited with code {}", code);
+          return Ok(());
+        }
+        nix::sys::wait::WaitStatus::Signaled(_, sig, _) => {
+          println!("Process killed by signal {:?}", sig);
+          return Ok(());
+        }
+        _ => {} // Continue stepping
+      }
+
       steps += 1;
 
       let pc = self.get_pc()?;
+      let current_rbp = get_register_value(self.pid, Register::Rbp)?;
 
       // Check if we ended up at an invalid address (stack, etc.)
       if !self.is_valid_code_address(pc) {
@@ -483,7 +526,24 @@ impl Debugger {
         .pc_to_function(self.get_dwarf_pc()?)
         .ok()
         .flatten();
-      if current_func != start_func {
+
+      // If RBP has increased past our starting frame, we've returned from the function
+      // (Stack grows down, so a larger RBP means fewer frames on stack)
+      if current_rbp > start_rbp {
+        // Check if we're in user code (another function) or library code
+        if current_func.is_some() {
+          // Back in user code, in a different function - we've returned
+          break;
+        } else {
+          // In library code (like libc's exit code after main returns)
+          println!("Function returned. Now in library code at 0x{:x}.", pc);
+          println!("Use 'continue' to run to next breakpoint or program exit.");
+          return Ok(());
+        }
+      }
+
+      // Also check if function changed while at same or deeper stack level
+      if current_func.is_some() && current_func != start_func {
         break;
       }
 
@@ -566,9 +626,10 @@ impl Debugger {
     let mut return_bp_set = false;
 
     // Method 1: Traditional RBP+8 (may fail if frame not set up yet)
+    // Use is_any_executable_address since return may be to library code
     if let Ok(rbp_return) = ptrace::read(self.pid, (frame_ptr + 8) as AddressType) {
       let rbp_return = rbp_return as u64;
-      if self.is_valid_code_address(rbp_return) {
+      if self.is_any_executable_address(rbp_return) {
         let addr = rbp_return as AddressType;
         if !self.breakpoints.contains_key(&addr) {
           self.set_temp_breakpoint(addr)?;
@@ -581,7 +642,7 @@ impl Debugger {
     if !return_bp_set {
       if let Ok(rsp_return) = ptrace::read(self.pid, stack_ptr as AddressType) {
         let rsp_return = rsp_return as u64;
-        if self.is_valid_code_address(rsp_return) {
+        if self.is_any_executable_address(rsp_return) {
           let addr = rsp_return as AddressType;
           if !self.breakpoints.contains_key(&addr) {
             self.set_temp_breakpoint(addr)?;
@@ -604,8 +665,9 @@ impl Debugger {
       return Ok(()); // Already have a breakpoint here
     }
 
-    // Validate that address is in executable code region
-    if !self.is_valid_code_address(addr as u64) {
+    // Validate that address is in ANY executable code region (including libraries)
+    // This is needed for return addresses that may point to libc
+    if !self.is_any_executable_address(addr as u64) {
       return Ok(());
     }
 

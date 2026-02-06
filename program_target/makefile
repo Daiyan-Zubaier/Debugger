@@ -3,7 +3,7 @@ CFLAGS_DEBUG = -g -O0
 CFLAGS_OPTIMIZED = -g -O2
 
 # Default target
-all: main test_step test_loop
+all: main test_step test_loop seg_fault
 
 # Main test program
 main: main.c

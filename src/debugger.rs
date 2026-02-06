@@ -260,9 +260,21 @@ impl Debugger {
     ))
   }
 
-  /// Check if an address is in an executable code region of our program.
-  /// Returns false for stack addresses, heap, libraries, etc.
+  /// Check if an address is in an executable code region of our program
+  /// Returns false for stack addresses, heap, libraries, etc
   pub(crate) fn is_valid_code_address(&self, addr: u64) -> bool {
+    self.is_executable_address_in_program(addr, true)
+  }
+
+  /// Check if an address is in ANY executable code region (including libraries)
+  /// Use this for validating return addresses which may be in libc
+  pub(crate) fn is_any_executable_address(&self, addr: u64) -> bool {
+    self.is_executable_address_in_program(addr, false)
+  }
+
+  /// Helper: Check if address is in an executable region
+  /// If `our_program_only` is true, only accepts our program's code
+  fn is_executable_address_in_program(&self, addr: u64, our_program_only: bool) -> bool {
     let maps_path = format!("/proc/{}/maps", self.pid);
     let maps = match std::fs::read_to_string(&maps_path) {
       Ok(m) => m,
@@ -316,8 +328,12 @@ impl Debugger {
         Err(_) => continue,
       };
 
-      // Check if address is in this range AND it's our program (not a library)
+      // Check if address is in this executable range
       if addr >= start && addr < end {
+        if !our_program_only {
+          return true; // Any executable region is valid
+        }
+        // Only our program's code
         if let Some(p) = path {
           if p.ends_with(&self.program_name) || p.ends_with(prog_base) {
             return true;
@@ -404,8 +420,8 @@ impl Debugger {
       return Ok(());
     }
 
-    // Note: Breakpoint handling is done by the signal handler when we hit one.
-    // Here we just need to step the instruction.
+    // Note: Breakpoint handling is done by the signal handler when we hit one
+    // Here we just need to step the instruction
     ptrace::step(self.pid, None)?;
     Ok(())
   }
