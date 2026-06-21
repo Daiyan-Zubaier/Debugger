@@ -332,6 +332,7 @@ fn hex_nibble(value: u8) -> Result<u8> {
   }
 }
 
+
 #[cfg(test)]
 mod tests {
   use super::*;

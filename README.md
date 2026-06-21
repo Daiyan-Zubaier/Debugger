@@ -1,10 +1,10 @@
 A small Rust debugger for Cortex-M Micros and x86 Linux, has TUI 🤯 No one is using an IDE 🗣️
 
 ## Pics
-![alt text](image.png)
+![alt text](docs/image.png)
 Debugging main.c in program_target/
 
-![alt text](image-1.png)
+![alt text](docs/image-1.png)
 Debugging some simple non HAL code I wrote for the STM32 a while back.
 ## Linux x86-64 Mode
 
