@@ -1,8 +1,3 @@
-//TODO:  Add ARM support
-//TODO:  Clean up match statements to maybe use REG_DESCS?
-// ^ Match statements mainly used for speed, but idk if it really matters for a short list of registers
-// + Makes adding/removing registers a little bit easier
-
 use nix::Result;
 use nix::sys::ptrace;
 use nix::unistd::Pid;
@@ -55,7 +50,6 @@ const NUMBER_OF_REGISTERS: usize = Register::COUNT;
 
 pub struct RegDesc {
   pub reg: Register,
-  pub dwarf: Option<u16>,
   pub name: &'static str,
 }
 
@@ -63,141 +57,114 @@ pub const REG_DESCS: [RegDesc; NUMBER_OF_REGISTERS] = [
   // General purpose registers
   RegDesc {
     reg: Register::Rax,
-    dwarf: Some(0),
     name: "rax",
   },
   RegDesc {
     reg: Register::Rdx,
-    dwarf: Some(1),
     name: "rdx",
   },
   RegDesc {
     reg: Register::Rcx,
-    dwarf: Some(2),
     name: "rcx",
   },
   RegDesc {
     reg: Register::Rbx,
-    dwarf: Some(3),
     name: "rbx",
   },
   RegDesc {
     reg: Register::Rsi,
-    dwarf: Some(4),
     name: "rsi",
   },
   RegDesc {
     reg: Register::Rdi,
-    dwarf: Some(5),
     name: "rdi",
   },
   RegDesc {
     reg: Register::Rbp,
-    dwarf: Some(6),
     name: "rbp",
   },
   RegDesc {
     reg: Register::Rsp,
-    dwarf: Some(7),
     name: "rsp",
   },
   RegDesc {
     reg: Register::R8,
-    dwarf: Some(8),
     name: "r8",
   },
   RegDesc {
     reg: Register::R9,
-    dwarf: Some(9),
     name: "r9",
   },
   RegDesc {
     reg: Register::R10,
-    dwarf: Some(10),
     name: "r10",
   },
   RegDesc {
     reg: Register::R11,
-    dwarf: Some(11),
     name: "r11",
   },
   RegDesc {
     reg: Register::R12,
-    dwarf: Some(12),
     name: "r12",
   },
   RegDesc {
     reg: Register::R13,
-    dwarf: Some(13),
     name: "r13",
   },
   RegDesc {
     reg: Register::R14,
-    dwarf: Some(14),
     name: "r14",
   },
   RegDesc {
     reg: Register::R15,
-    dwarf: Some(15),
     name: "r15",
   },
   // Instruction pointer and flags
   RegDesc {
     reg: Register::Rip,
-    dwarf: None,
     name: "rip",
   },
   RegDesc {
     reg: Register::RFlags,
-    dwarf: Some(49),
     name: "eflags",
   },
   // Segment registers
   RegDesc {
     reg: Register::Es,
-    dwarf: Some(50),
     name: "es",
   },
   RegDesc {
     reg: Register::Cs,
-    dwarf: Some(51),
     name: "cs",
   },
   RegDesc {
     reg: Register::Ss,
-    dwarf: Some(52),
     name: "ss",
   },
   RegDesc {
     reg: Register::Ds,
-    dwarf: Some(53),
     name: "ds",
   },
   RegDesc {
     reg: Register::Fs,
-    dwarf: Some(54),
     name: "fs",
   },
   RegDesc {
     reg: Register::Gs,
-    dwarf: Some(55),
     name: "gs",
   },
   // Segment bases
   RegDesc {
     reg: Register::FsBase,
-    dwarf: Some(58),
     name: "fs_base",
   },
   RegDesc {
     reg: Register::GsBase,
-    dwarf: Some(59),
     name: "gs_base",
   },
   // Syscall ABI
   RegDesc {
     reg: Register::OrigRax,
-    dwarf: None,
     name: "orig_rax",
   },
 ];

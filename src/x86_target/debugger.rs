@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::os::fd::RawFd;
+use std::path::{Path, PathBuf};
 
 use nix::Result;
+use nix::libc;
 use nix::sys::ptrace::{self, AddressType};
 use nix::sys::signal::Signal;
 use nix::sys::wait::{WaitStatus, waitpid};
@@ -9,14 +12,27 @@ use nix::unistd::Pid;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
-use crate::breakpoint::Breakpoint;
 use crate::elf_debug_info::ElfDebugInfo;
-use crate::registers::{Register, get_register_value, set_register_value};
 
-// Core debugger Module
+use super::breakpoint::Breakpoint;
+use super::registers::{Register, get_register_value, set_register_value};
 
-/// Struct to hold debugger information
-pub struct Debugger {
+#[derive(Debug, Eq, PartialEq)]
+struct ProcessMapEntry {
+  start: u64,
+  end: u64,
+  offset: u64,
+  path: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct MappedObject {
+  name: String,
+  offset: u64,
+}
+
+/// State for a local Linux `ptrace` debugging session
+pub struct LinuxPtraceDebugger {
   /// Path to program
   pub(crate) program_name: String,
 
@@ -29,19 +45,27 @@ pub struct Debugger {
   /// Flag to indicate the program has crashed (received a fatal signal like SIGSEGV)
   pub(crate) has_crashed: bool,
 
-  /// A hash map of all breakpoints
+  /// Active breakpoints keyed by runtime address
   pub(crate) breakpoints: HashMap<AddressType, Breakpoint>,
 
   /// Temporary breakpoints to remove after being hit (used by step_out, step_over)
   pub(crate) temp_breakpoints: HashSet<AddressType>,
 
-  /// AN object to hold debug info
+  /// ELF/DWARF debug information for source-level lookups
   pub(crate) debug_info: ElfDebugInfo,
+
+  /// Optional nonblocking fd used by the TUI to capture debuggee stdout/stderr
+  pub(crate) output_fd: Option<RawFd>,
 }
 
-impl Debugger {
-  /// Construct new Debugger object
+impl LinuxPtraceDebugger {
+  /// Construct a debugger for a forked Linux child process
   pub fn new(program_name: String, pid: Pid) -> Self {
+    Self::new_with_output_fd(program_name, pid, None)
+  }
+
+  /// Construct a debugger with an optional captured-output file descriptor
+  pub fn new_with_output_fd(program_name: String, pid: Pid, output_fd: Option<RawFd>) -> Self {
     let debug_info =
       ElfDebugInfo::new(program_name.clone()).expect("Error constructing ElfDebugInfo"); // expect used since unrecoverable state
 
@@ -53,14 +77,13 @@ impl Debugger {
       breakpoints: HashMap::new(),
       temp_breakpoints: HashSet::new(),
       debug_info,
+      output_fd,
     }
   }
 
-  /// Run the debugger
+  /// Run the non-tui Linux debugger REPL
   pub fn run(&mut self) -> rustyline::Result<()> {
-    // For now Option is set to None. This means it only blocks until child exits or is killed.
-    // options is a bitmask that determines which state transitions to block
-    // Waits for thread to be ready
+    // Wait for the child to stop after ptrace::traceme + execvp
     match waitpid(self.pid, None)? {
       // Sends SIGTRAP signal
       WaitStatus::Stopped(_, _) => {
@@ -135,6 +158,9 @@ impl Debugger {
         }
       }
     }
+    if let Err(e) = self.cleanup_all_temp_breakpoints() {
+      println!("Failed to clean up temporary breakpoints: {:?}", e);
+    }
     rl.save_history("history.txt")?;
     Ok(())
   }
@@ -181,25 +207,36 @@ impl Debugger {
 
   /// Prints location
   pub(crate) fn print_location(&self, runtime_pc: u64) {
-    let dwarf_pc = self.to_dwarf_pc(runtime_pc);
+    println!("{}", self.format_location(runtime_pc));
+  }
 
+  /// Format a runtime address as function and source location text
+  pub(crate) fn format_location(&self, runtime_pc: u64) -> String {
+    let dwarf_pc = self.to_dwarf_pc(runtime_pc);
     let func = self.debug_info.pc_to_function(dwarf_pc).ok().flatten();
     let loc = self.debug_info.pc_to_file_line(dwarf_pc).ok().flatten();
 
     match (func, loc) {
-      (Some(f), Some((file, line))) => {
-        println!("At {f} ({file}:{line})");
-      }
-      (Some(f), None) => {
-        println!("At {f} (no line info)");
-      }
-      (None, Some((file, line))) => {
-        println!("At {file}:{line}");
-      }
-      (None, None) => {
-        println!("At 0x{:x} (no DWARF match)", runtime_pc);
-      }
+      (Some(f), Some((file, line))) => format!("At {f} ({file}:{line})"),
+      (Some(f), None) => format!("At {f} (no line info)"),
+      (None, Some((file, line))) => format!("At {file}:{line}"),
+      (None, None) => self
+        .mapped_object_for_addr(runtime_pc)
+        .map(|object| {
+          format!(
+            "At 0x{runtime_pc:x} ({} + 0x{:x}, no DWARF match)",
+            object.name, object.offset
+          )
+        })
+        .unwrap_or_else(|| format!("At 0x{runtime_pc:x} (no DWARF match)")),
     }
+  }
+
+  /// Resolve a runtime address to the mapped object that owns it
+  fn mapped_object_for_addr(&self, runtime_addr: u64) -> Option<MappedObject> {
+    let maps_path = format!("/proc/{}/maps", self.pid);
+    let maps = std::fs::read_to_string(maps_path).ok()?;
+    mapped_object_for_addr(&maps, runtime_addr)
   }
 
   /// Loads bias from /proc/pid/maps
@@ -334,10 +371,10 @@ impl Debugger {
           return true; // Any executable region is valid
         }
         // Only our program's code
-        if let Some(p) = path {
-          if p.ends_with(&self.program_name) || p.ends_with(prog_base) {
-            return true;
-          }
+        if let Some(p) = path
+          && (p.ends_with(&self.program_name) || p.ends_with(prog_base))
+        {
+          return true;
         }
       }
     }
@@ -381,23 +418,9 @@ impl Debugger {
 
   /// Print a single source line given file path and line number
   pub(crate) fn print_source(&self, path: &str, line: u64) -> Result<()> {
-    use std::fs;
-    use std::path::Path;
+    let resolved_path = self.resolve_source_path(path);
 
-    // Try the path as is first
-    let mut resolved_path = Path::new(path).to_path_buf();
-
-    // If it doesn't exist and is relative, try resolving relative to program directory
-    if !resolved_path.exists() && !path.starts_with('/') {
-      if let Some(program_dir) = Path::new(&self.program_name).parent() {
-        let candidate = program_dir.join(path);
-        if candidate.exists() {
-          resolved_path = candidate;
-        }
-      }
-    }
-
-    if let Ok(contents) = fs::read_to_string(&resolved_path) {
+    if let Ok(contents) = std::fs::read_to_string(&resolved_path) {
       let idx = line.saturating_sub(1) as usize;
       if let Some(src_line) = contents.lines().nth(idx) {
         // Yellow text: \x1b[33m, Reset: \x1b[0m
@@ -409,6 +432,37 @@ impl Debugger {
       println!("Unable to read source file: {}", path);
     }
     Ok(())
+  }
+
+  /// Resolve source paths from DWARF against the debuggee directory when needed
+  pub(crate) fn resolve_source_path(&self, path: &str) -> PathBuf {
+    let source_path = Path::new(path);
+    if source_path.exists() || source_path.is_absolute() {
+      return source_path.to_path_buf();
+    }
+
+    if let Ok(current_dir) = std::env::current_dir() {
+      let candidate = current_dir.join(source_path);
+      if candidate.exists() {
+        return candidate;
+      }
+    }
+
+    if let Some(program_dir) = Path::new(&self.program_name).parent() {
+      let candidate = program_dir.join(source_path);
+      if candidate.exists() {
+        return candidate;
+      }
+
+      if let Some(parent_dir) = program_dir.parent() {
+        let candidate = parent_dir.join(source_path);
+        if candidate.exists() {
+          return candidate;
+        }
+      }
+    }
+
+    source_path.to_path_buf()
   }
 
   /// stepi instruction - single step one instruction
@@ -424,5 +478,92 @@ impl Debugger {
     // Here we just need to step the instruction
     ptrace::step(self.pid, None)?;
     Ok(())
+  }
+}
+
+fn mapped_object_for_addr(maps: &str, runtime_addr: u64) -> Option<MappedObject> {
+  let entry = maps
+    .lines()
+    .filter_map(parse_process_map_entry)
+    .find(|entry| runtime_addr >= entry.start && runtime_addr < entry.end)?;
+
+  let name = entry
+    .path
+    .as_deref()
+    .map(map_path_label)
+    .unwrap_or_else(|| "anonymous mapping".to_string());
+  let offset = runtime_addr.saturating_sub(entry.start) + entry.offset;
+
+  Some(MappedObject { name, offset })
+}
+
+fn parse_process_map_entry(line: &str) -> Option<ProcessMapEntry> {
+  let mut parts = line.split_whitespace();
+  let range = parts.next()?;
+  let _perms = parts.next()?;
+  let offset_hex = parts.next()?;
+  let _dev = parts.next()?;
+  let _inode = parts.next()?;
+  let path = parts.next().map(str::to_string);
+
+  let (start_hex, end_hex) = range.split_once('-')?;
+  let start = u64::from_str_radix(start_hex, 16).ok()?;
+  let end = u64::from_str_radix(end_hex, 16).ok()?;
+  let offset = u64::from_str_radix(offset_hex, 16).ok()?;
+
+  Some(ProcessMapEntry {
+    start,
+    end,
+    offset,
+    path,
+  })
+}
+
+fn map_path_label(path: &str) -> String {
+  Path::new(path)
+    .file_name()
+    .and_then(|name| name.to_str())
+    .unwrap_or(path)
+    .to_string()
+}
+
+impl Drop for LinuxPtraceDebugger {
+  fn drop(&mut self) {
+    if let Some(fd) = self.output_fd.take() {
+      unsafe {
+        libc::close(fd);
+      }
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{MappedObject, mapped_object_for_addr, parse_process_map_entry};
+
+  #[test]
+  fn parses_process_map_entry() {
+    let entry = parse_process_map_entry(
+      "7ffff7dcf000-7ffff7f24000 r-xp 00026000 08:01 123 /usr/lib/libc.so.6",
+    )
+    .unwrap();
+
+    assert_eq!(entry.start, 0x7ffff7dcf000);
+    assert_eq!(entry.end, 0x7ffff7f24000);
+    assert_eq!(entry.offset, 0x26000);
+    assert_eq!(entry.path.as_deref(), Some("/usr/lib/libc.so.6"));
+  }
+
+  #[test]
+  fn resolves_mapped_object_offset() {
+    let maps = "7ffff7dcf000-7ffff7f24000 r-xp 00026000 08:01 123 /usr/lib/libc.so.6\n";
+
+    assert_eq!(
+      mapped_object_for_addr(maps, 0x7ffff7df7249),
+      Some(MappedObject {
+        name: "libc.so.6".to_string(),
+        offset: 0x4e249,
+      })
+    );
   }
 }

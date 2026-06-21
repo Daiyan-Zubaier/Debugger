@@ -3,23 +3,23 @@ use nix::libc::c_long;
 use nix::sys::ptrace::{self, AddressType};
 use nix::sys::wait::waitpid;
 
-use crate::breakpoint::Breakpoint;
-use crate::debugger::Debugger;
-use crate::registers::{
+use super::breakpoint::Breakpoint;
+use super::debugger::LinuxPtraceDebugger;
+use super::registers::{
   REG_DESCS, Register, get_register_from_name, get_register_value, set_register_value,
 };
 
 // Command handling for the debugger
 //
-// This module contains methods for processing user commands.
+// This module contains methods for processing user commands
 
-impl Debugger {
+impl LinuxPtraceDebugger {
   /// Command handler, pass in command to be "handled"
   ///
   /// For now the commands are:
   /// - continue (to continue execution of the program)
   /// - break (to set a breakpoint)
-  /// - and more...
+  /// - and more
   pub(crate) fn handle_command(&mut self, line: &str) -> Result<()> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let command = match tokens.first() {
@@ -36,6 +36,7 @@ impl Debugger {
       "stepi" => self.single_step()?,
       "finish" => self.step_out()?,
       "step" | "s" => self.step_in()?,
+      "backtrace" | "bt" => self.print_backtrace()?,
       _ => println!("Invalid command"),
     }
     Ok(())
@@ -639,14 +640,12 @@ impl Debugger {
     }
 
     // Method 2: Try RSP (for leaf functions or after prologue)
-    if !return_bp_set {
-      if let Ok(rsp_return) = ptrace::read(self.pid, stack_ptr as AddressType) {
-        let rsp_return = rsp_return as u64;
-        if self.is_any_executable_address(rsp_return) {
-          let addr = rsp_return as AddressType;
-          if !self.breakpoints.contains_key(&addr) {
-            self.set_temp_breakpoint(addr)?;
-          }
+    if !return_bp_set && let Ok(rsp_return) = ptrace::read(self.pid, stack_ptr as AddressType) {
+      let rsp_return = rsp_return as u64;
+      if self.is_any_executable_address(rsp_return) {
+        let addr = rsp_return as AddressType;
+        if !self.breakpoints.contains_key(&addr) {
+          self.set_temp_breakpoint(addr)?;
         }
       }
     }
@@ -681,10 +680,10 @@ impl Debugger {
   /// Clean up a single temporary breakpoint
   pub(crate) fn cleanup_temp_breakpoint(&mut self, addr: AddressType) -> Result<()> {
     if self.temp_breakpoints.remove(&addr) {
-      if let Some(bp) = self.breakpoints.get_mut(&addr) {
-        if bp.enabled_status {
-          bp.disable()?;
-        }
+      if let Some(bp) = self.breakpoints.get_mut(&addr)
+        && bp.enabled_status
+      {
+        bp.disable()?;
       }
       self.breakpoints.remove(&addr);
     }

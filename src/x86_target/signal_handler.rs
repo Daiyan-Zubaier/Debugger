@@ -2,9 +2,9 @@ use nix::Result;
 use nix::libc::{SI_KERNEL, TRAP_BRKPT, TRAP_TRACE};
 use nix::sys::ptrace::{self, AddressType};
 
-use crate::debugger::Debugger;
+use super::debugger::LinuxPtraceDebugger;
 
-impl Debugger {
+impl LinuxPtraceDebugger {
   /// Handler to deal with SIGTRAP
   pub(crate) fn handle_sigtrap(&mut self) -> Result<()> {
     let sig_info = ptrace::getsiginfo(self.pid)?;

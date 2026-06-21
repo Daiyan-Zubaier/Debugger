@@ -1,10 +1,9 @@
-pub mod breakpoint;
-pub mod debugger;
+pub mod arm_target;
 pub mod elf_debug_info;
-pub mod registers;
+pub mod target;
+pub mod tui;
+pub mod x86_target;
 
-mod command_handler;
-mod signal_handler;
-
-pub use debugger::Debugger;
+pub use arm_target::RemoteArmDebugger;
 pub use elf_debug_info::ElfDebugInfo;
+pub use x86_target::LinuxPtraceDebugger;
